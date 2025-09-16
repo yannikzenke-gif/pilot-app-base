@@ -117,8 +117,9 @@ specific_departure_date = st.sidebar.selectbox("Specific departure date", option
 arrival_dates = pd.Series(df['Arrival'].dt.date.dropna().unique()).sort_values()
 specific_arrival_date = st.sidebar.selectbox("Specific arrival date", options=["Any"] + arrival_dates.astype(str).tolist())
 
-# Exclude specific dates
-all_dates = pd.Series(df['Departure'].dt.date.append(df['Arrival'].dt.date).dropna().unique()).sort_values()
+# Exclude specific dates (FIXED)
+all_dates = pd.concat([df['Departure'].dt.date, df['Arrival'].dt.date]).dropna().unique()
+all_dates = pd.Series(all_dates).sort_values()
 excluded_dates = st.sidebar.multiselect(
     "Exclude specific dates (departure or arrival)", options=all_dates.astype(str).tolist()
 )
