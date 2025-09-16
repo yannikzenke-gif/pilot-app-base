@@ -117,11 +117,11 @@ specific_departure_date = st.sidebar.selectbox("Specific departure date", option
 arrival_dates = pd.Series(df['Arrival'].dt.date.dropna().unique()).sort_values()
 specific_arrival_date = st.sidebar.selectbox("Specific arrival date", options=["Any"] + arrival_dates.astype(str).tolist())
 
-# Exclude specific dates (FIXED)
+# Exclude specific dates (improved to exclude all pairings containing any excluded date in the range)
 all_dates = pd.concat([df['Departure'].dt.date, df['Arrival'].dt.date]).dropna().unique()
 all_dates = pd.Series(all_dates).sort_values()
 excluded_dates = st.sidebar.multiselect(
-    "Exclude specific dates (departure or arrival)", options=all_dates.astype(str).tolist()
+    "Exclude specific dates (any day in pairing)", options=all_dates.astype(str).tolist()
 )
 
 # Preferred departure/arrival weekday
@@ -161,12 +161,15 @@ if specific_departure_date != "Any":
 if specific_arrival_date != "Any":
     filtered_df = filtered_df[filtered_df['Arrival'].dt.date.astype(str) == specific_arrival_date]
 
-# Exclude dates
+# Exclude dates: improved logic to exclude pairings where ANY day in the pairing's range matches an excluded date
 if excluded_dates:
-    filtered_df = filtered_df[
-        ~filtered_df['Departure'].dt.date.astype(str).isin(excluded_dates) &
-        ~filtered_df['Arrival'].dt.date.astype(str).isin(excluded_dates)
-    ]
+    excluded_dates_dt = set(pd.to_datetime(excluded_dates).date)
+    def exclude_pairing(row):
+        if pd.isna(row['Departure']) or pd.isna(row['Arrival']):
+            return False  # If data is invalid, do not exclude (or adjust as needed)
+        pairing_days = pd.date_range(row['Departure'].date(), row['Arrival'].date())
+        return any(day in excluded_dates_dt for day in pairing_days)
+    filtered_df = filtered_df[~filtered_df.apply(exclude_pairing, axis=1)]
 
 # Preferred departure or arrival weekday
 if preferred_departure_weekday != "Any":
