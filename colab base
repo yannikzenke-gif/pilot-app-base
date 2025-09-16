@@ -1,0 +1,689 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+from datetime import datetime, time, timedelta
+
+def parse_flight_pairings_csv(csv_path):
+    """
+    Reads flight pairing data from a CSV file, converts date/time columns,
+    calculates block hours, identifies departure day, calculates weekend/holiday hours,
+    calculates duration in days, block hours per pairing day, renames 'Number of Flights'
+    to 'Roundtrips', and calculates 'Actual Flights per Day'.
+
+    Args:
+        csv_path (str): The path to the CSV file.
+
+    Returns:
+        pd.DataFrame: DataFrame with processed flight data, including new calculated columns,
+                      or an empty DataFrame if parsing fails.
+    """
+    try:
+        df = pd.read_csv(csv_path)
+
+        # --- Adjusting for the new CSV column names and formats ---
+        # Map new column names to the names expected by the rest of the code
+        # Based on the preview:
+        # 'Pairing' -> 'Pairing'
+        # 'Pre-assigned' -> 'Pre-assigned' (not used in filtering, but keep for completeness)
+        # 'Duration' -> 'Duration' (used to calculate 'Pairing Duration Days')
+        # 'AC' -> 'AC' (not used in filtering, but keep for completeness)
+        # 'Departure' -> 'Departure'
+        # 'Arrival' -> 'Arrival'
+        # 'Pairing details' -> 'Pairing details'
+        # 'Block hours' -> 'Block hours'
+
+        # Ensure required columns exist in the new CSV
+        required_cols = ['Pairing', 'Departure', 'Arrival', 'Block hours', 'Pairing details', 'Duration']
+        if not all(col in df.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in df.columns]
+            print(f"Error: New CSV is missing required columns: {missing}")
+            return pd.DataFrame()
+
+
+        # Convert data types for proper analysis and filtering
+        if not df.empty:
+            # Attempt to convert relevant columns, coercing errors
+            # Adjusted format string for the new 'Departure' and 'Arrival' format
+            df['Departure'] = pd.to_datetime(df['Departure'], format='%b %d,%Y %H:%M', errors='coerce')
+            df['Arrival'] = pd.to_datetime(df['Arrival'], format='%b %d,%Y %H:%M', errors='coerce')
+
+            # 'Block hours' is in HH:MM format in the new CSV
+            # Convert to timedelta. Using errors='coerce' for robustness.
+            # The original code's approach of adding ':00' and converting to timedelta is suitable here too.
+            df['Block hours'] = pd.to_timedelta(df['Block hours'].astype(str) + ':00', errors='coerce')
+
+
+            if not df.empty:
+                # Create 'Departure Day', handling potential NaT values
+                # Ensure consistent string format (lowercase)
+                df['Departure Day'] = df['Departure'].dt.day_name().str.lower()
+                # Create 'Arrival Day', handling potential NaT values
+                 # Ensure consistent string format (lowercase)
+                df['Arrival Day'] = df['Arrival'].dt.day_name().str.lower()
+
+                # Debug: Display 'Arrival' and 'Arrival Day' columns (removed for final version)
+                # print("\n--- Debugging 'Arrival Day' (after parsing) ---")
+                # print("First 5 values of 'Arrival':")
+                # print(df['Arrival'].head().to_string())
+                # print("\nFirst 5 values of 'Arrival Day':")
+                # print(df['Arrival Day'].head().to_string())
+                # print("\nValue counts for 'Arrival Day':")
+                # print(df['Arrival Day'].value_counts(dropna=False).to_string())
+                # print("--- End Debugging ---\n")
+
+
+                # Calculate Boosted Hours (Weekends and Panamanian National Holidays)
+                df['Boosted Hours'] = 0.0
+
+                # Define Panamanian National Holidays for the relevant year (2025 based on data preview)
+                # This list should be updated annually
+                panama_holidays_2025 = [
+                    datetime(2025, 1, 1),   # New Year's Day
+                    datetime(2025, 3, 4),   # Carnival Tuesday (approximate, can vary) - assuming March 4, 2025
+                    datetime(2025, 4, 18),  # Good Friday
+                    datetime(2025, 5, 1),   # Labour Day
+                    datetime(2025, 11, 3),  # Separation Day
+                    datetime(2025, 11, 4),  # Flag Day
+                    datetime(2025, 11, 5),  # Colon Day
+                    datetime(2025, 11, 10), # First Call of Independence
+                    datetime(2025, 11, 28), # Independence from Spain
+                    datetime(2025, 12, 8),  # Mother's Day
+                    datetime(2025, 12, 25)  # Christmas Day
+                ]
+                # Convert to pandas DatetimeIndex for easier checking
+                panama_holidays_dtindex = pd.to_datetime(panama_holidays_2025).normalize()
+
+
+                # Iterate through each row to calculate boosted hours
+                # This might be slow for very large datasets, but is accurate for overlapping periods
+                for index, row in df.iterrows():
+                    departure_time = row['Departure']
+                    arrival_time = row['Arrival']
+                    block_hours_td = row['Block hours']
+
+                    # Skip if departure, arrival, or block hours are invalid
+                    if pd.isna(departure_time) or pd.isna(arrival_time) or pd.isna(block_hours_td):
+                        continue
+
+                    # Calculate total duration in hours
+                    total_duration_hours = block_hours_td.total_seconds() / 3600
+
+                    # Initialize boosted hours for this row
+                    current_boosted_hours = 0.0
+
+                    # Check for weekend hours (Saturday 00:00 to Sunday 23:59) within the flight duration
+                    # We need to iterate through the time range and check if each hour (or smaller interval)
+                    # falls on a weekend or holiday. A simpler approximation is to check the start and end days
+                    # and any full days in between. A more precise method involves iterating through intervals.
+                    # For simplicity and reasonable accuracy, let's check the start and end timestamps
+                    # and any full days covered.
+
+                    # Check if departure day is a weekend (Saturday or Sunday)
+                    if departure_time.dayofweek >= 5: # Saturday is 5, Sunday is 6
+                        # If the flight starts on a weekend, calculate how many hours of the first day are weekend
+                        end_of_departure_day = departure_time.replace(hour=23, minute=59, second=59)
+                        weekend_hours_on_departure_day = min(arrival_time, end_of_departure_day) - departure_time
+                        current_boosted_hours += max(timedelta(0), weekend_hours_on_departure_day).total_seconds() / 3600
+
+                    # Check if arrival day is a weekend (Saturday or Sunday) and different from departure day
+                    if arrival_time.dayofweek >= 5 and arrival_time.date() != departure_time.date():
+                         # If the flight ends on a weekend, calculate how many hours of the last day are weekend
+                        start_of_arrival_day = arrival_time.replace(hour=0, minute=0, second=0)
+                        weekend_hours_on_arrival_day = arrival_time - max(departure_time, start_of_arrival_day)
+                        current_boosted_hours += max(timedelta(0), weekend_hours_on_arrival_day).total_seconds() / 3600
+
+                    # Check for full weekend days between departure and arrival
+                    current_day = (departure_time + timedelta(days=1)).normalize()
+                    while current_day < arrival_time.normalize():
+                        if current_day.dayofweek >= 5: # Saturday or Sunday
+                            current_boosted_hours += 24 # Add 24 hours for a full weekend day
+                        current_day += timedelta(days=1)
+
+                    # Check for holiday hours
+                    # Iterate through the days the flight covers and check if any are holidays
+                    current_day = departure_time.normalize()
+                    while current_day <= arrival_time.normalize():
+                        if current_day in panama_holidays_dtindex:
+                             # If a holiday falls within the flight duration, add the hours on that day that overlap
+                             start_of_day = current_day.replace(hour=0, minute=0, second=0)
+                             end_of_day = current_day.replace(hour=23, minute=59, second=59)
+
+                             overlap_start = max(departure_time, start_of_day)
+                             overlap_end = min(arrival_time, end_of_day)
+
+                             if overlap_start < overlap_end:
+                                 holiday_hours_on_day = (overlap_end - overlap_start).total_seconds() / 3600
+                                 current_boosted_hours += holiday_hours_on_day
+
+                        current_day += timedelta(days=1)
+
+
+                    # Ensure boosted hours do not exceed total block hours (due to approximations)
+                    df.loc[index, 'Boosted Hours'] = min(current_boosted_hours, total_duration_hours)
+
+                # Calculate Duration in Days and Block Hours per Pairing Day
+                # Calculate the number of days spanned by the pairing
+                # Add 1 to include both the departure and arrival days if they are different
+                # Use the 'Duration' column from the new CSV directly if it represents duration in days
+                # Based on preview, 'Duration' seems to be duration in days, let's use it.
+                if 'Duration' in df.columns:
+                    df['Pairing Duration Days'] = pd.to_numeric(df['Duration'], errors='coerce')
+                else:
+                     # Fallback to calculating from Departure/Arrival if 'Duration' is not suitable
+                     df['Pairing Duration Days'] = (df['Arrival'].dt.date - df['Departure'].dt.date).apply(lambda x: x.days) + 1
+
+
+                # Calculate Block Hours per Pairing Day
+                # Handle potential division by zero if Pairing Duration Days is 0 or NaN
+                df['Block Hours per Pairing Day'] = df.apply(lambda row: (row['Block hours'].total_seconds() / 3600) / row['Pairing Duration Days'] if pd.notna(row['Block hours']) and pd.notna(row['Pairing Duration Days']) and row['Pairing Duration Days'] > 0 else 0, axis=1)
+
+                # Calculate Roundtrips (Renamed from 'Number of Flights')
+                def count_roundtrips(pairing_details):
+                    if pd.isna(pairing_details):
+                        return 0
+                    airport_list = [a.strip() for a in pairing_details.split('-')]
+                    if not airport_list:
+                        return 0
+
+                    home_base = 'PTY'
+                    pty_count_after_first = 0
+                    found_first_pty = False
+
+                    for airport in airport_list:
+                        if airport == home_base:
+                            if found_first_pty:
+                                pty_count_after_first += 1
+                            else:
+                                found_first_pty = True
+
+                    # If the pairing starts and ends at PTY, the number of flights is the number of times PTY appears after the first.
+                    # If it doesn't start and end at PTY, the logic might be different.
+                    # Assuming all pairings in the data start and end with PTY based on the examples.
+                    return pty_count_after_first
+
+                df['Roundtrips'] = df['Pairing details'].astype(str).apply(count_roundtrips)
+
+                # Calculate Actual Flights per Day
+                def calculate_actual_flights_per_day(row):
+                    pairing_details = row['Pairing details']
+                    pairing_duration_days = row['Pairing Duration Days']
+
+                    if pd.isna(pairing_details) or pd.isna(pairing_duration_days) or pairing_duration_days <= 0:
+                        return 0.0
+
+                    # Count segments (number of '-' + 1)
+                    num_segments = pairing_details.count('-') + 1
+
+                    return num_segments / pairing_duration_days
+
+                df['Actual Flights per Day'] = df.apply(calculate_actual_flights_per_day, axis=1)
+
+
+            else:
+                print("Warning: After initial processing, the DataFrame is empty.")
+
+        return df
+    except FileNotFoundError:
+        print(f"Error: The file '{csv_path}' was not found.")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"An error occurred while reading the CSV: {e}")
+        return pd.DataFrame()
+
+
+def get_user_preferences():
+    """
+    Prompts the user for flight pairing preferences via command line input.
+
+    Returns:
+        dict: A dictionary containing the user's selected preferences.
+    """
+    print("\n--- Please Enter Your Preferences ---")
+
+    # New: Specific Departure Date preference
+    departure_date_str = input("Enter specific departure date (YYYY-MM-DD) or leave blank for any: ")
+    try:
+        specific_departure_date = datetime.strptime(departure_date_str, '%Y-%m-%d').date() if departure_date_str else None
+    except ValueError:
+        print("Invalid departure date format. Please use YYYY-MM-DD.")
+        specific_departure_date = None
+
+    # New: Specific Arrival Date preference
+    arrival_date_str = input("Enter specific arrival date (YYYY-MM-DD) or leave blank for any: ")
+    try:
+        specific_arrival_date = datetime.strptime(arrival_date_str, '%Y-%m-%d').date() if arrival_date_str else None
+    except ValueError:
+        print("Invalid arrival date format. Please use YYYY-MM-DD.")
+        specific_arrival_date = None
+
+
+    # Create a mapping for common abbreviations and full names to full lowercase names
+    weekday_map = {
+        'mon': 'monday', 'tue': 'tuesday', 'wed': 'wednesday', 'thu': 'thursday',
+        'fri': 'friday', 'sat': 'saturday', 'sun': 'sunday',
+        'monday': 'monday', 'tuesday': 'tuesday', 'wednesday': 'wednesday',
+        'thursday': 'thursday', 'friday': 'friday', 'saturday': 'saturday',
+        'sunday': 'sunday'
+    }
+
+    # New: Preferred Departure Weekday
+    preferred_departure_weekday = input("Enter preferred departure weekday (e.g., Monday, or Mon) or leave blank for any: ")
+    # Normalize input to full lowercase name using the map
+    preferred_departure_weekday_processed = None
+    if preferred_departure_weekday:
+        preferred_departure_weekday_processed = weekday_map.get(preferred_departure_weekday.strip().lower(), preferred_departure_weekday.strip().lower())
+
+
+    # New: Preferred Arrival Weekday
+    preferred_arrival_weekday = input("Enter preferred arrival weekday (e.g., Wednesday, or Wed) or leave blank for any: ")
+    # Normalize input to full lowercase name using the map
+    preferred_arrival_weekday_processed = None
+    if preferred_arrival_weekday:
+        preferred_arrival_weekday_processed = weekday_map.get(preferred_arrival_weekday.strip().lower(), preferred_arrival_weekday.strip().lower())
+
+
+    # Existing: Preferred Weekdays (all days in pairing)
+    weekdays_input = input(f"Enter preferred weekdays (comma-separated, e.g., Monday,Friday, or Mon,Fri) for *all* days in pairing, or leave blank for any: ")
+    preferred_weekdays_processed = None
+    if weekdays_input:
+        # Convert user input weekdays to their full, lowercase names using the map, handling unknown inputs
+        preferred_weekdays_processed = [weekday_map.get(d.strip().lower(), d.strip().lower()) for d in weekdays_input.split(',')]
+
+    # New: Excluded Dates preference
+    excluded_dates_str = input("Enter specific dates to exclude (comma-separated, YYYY-MM-DD) or leave blank: ")
+    excluded_dates = []
+    if excluded_dates_str:
+        date_list = [d.strip() for d in excluded_dates_str.split(',')]
+        for date_str in date_list:
+            try:
+                excluded_dates.append(datetime.strptime(date_str, '%Y-%m-%d').date())
+            except ValueError:
+                print(f"Invalid date format for excluded date: {date_str}. Skipping this date.")
+                # Decide how to handle invalid dates - skip or return empty list/error
+                # For now, we'll skip the invalid date but continue processing others
+                pass # Skip invalid date
+
+
+    min_duration_str = input("Enter minimum flight duration in hours (e.g., 2.5) or leave blank for any: ")
+    min_duration = float(min_duration_str) if min_duration_str else None
+
+    max_duration_str = input("Enter maximum flight duration in hours (e.g., 10.0) or leave blank for any: ")
+    max_duration = float(max_duration_str) if max_duration_str else None
+
+    earliest_departure_str = input("Enter earliest departure time (HH:MM, e.g., 08:00) or leave blank for any: ")
+    try:
+        earliest_departure = datetime.strptime(earliest_departure_str, '%H:%M').time() if earliest_departure_str else None
+    except ValueError:
+        print("Invalid earliest departure time format. Please use HH:MM.")
+        earliest_departure = None
+
+    earliest_arrival_str = input("Enter earliest arrival time (HH:MM, e.g., 18:00) or leave blank for any: ")
+    try:
+        earliest_arrival = datetime.strptime(earliest_arrival_str, '%H:%M').time() if earliest_arrival_str else None
+    except ValueError:
+        print("Invalid earliest arrival time format. Please use HH:MM.")
+        earliest_arrival = None
+
+    max_roundtrips_str = input("Enter maximum number of roundtrips or leave blank for any: ")
+    max_roundtrips = int(max_roundtrips_str) if max_roundtrips_str and max_roundtrips_str.isdigit() else None
+
+    max_actual_flights_per_day_str = input("Enter maximum actual flights per day or leave blank for any: ")
+    max_actual_flights_per_day = float(max_actual_flights_per_day_str) if max_actual_flights_per_day_str else None
+
+    min_block_hours_per_day_str = input("Enter minimum block hours per pairing day (e.g., 6.0) or leave blank for any: ")
+    min_block_hours_per_day = float(min_block_hours_per_day_str) if min_block_hours_per_day_str else None
+
+    # New: Sorting preferences
+    sort_column = input(f"Enter column to sort by (e.g., 'Departure', 'Arrival', 'Block hours', 'Boosted Hours', 'Block Hours per Pairing Day', 'Roundtrips', 'Actual Flights per Day') or leave blank for default sorting: ")
+    sort_ascending_input = input("Sort ascending? (yes/no, default is no for descending): ").lower()
+    sort_ascending = sort_ascending_input == 'yes' if sort_ascending_input else False
+
+
+    prefs = {
+        'specific_departure_date': specific_departure_date,
+        'specific_arrival_date': specific_arrival_date,
+        'preferred_departure_weekday': preferred_departure_weekday_processed, # New preference
+        'preferred_arrival_weekday': preferred_arrival_weekday_processed,   # New preference
+        'weekdays': preferred_weekdays_processed, # Original preference (all days in pairing)
+        'excluded_dates': excluded_dates, # New preference
+        'min_duration': min_duration,
+        'max_duration': max_duration,
+        'earliest_departure': earliest_departure,
+        'earliest_arrival': earliest_arrival,
+        'max_roundtrips': max_roundtrips,
+        'max_actual_flights_per_day': max_actual_flights_per_day,
+        'min_block_hours_per_day': min_block_hours_per_day,
+        'sort_column': sort_column if sort_column else None,  # New preference
+        'sort_ascending': sort_ascending # New preference
+    }
+
+    return prefs
+
+
+def find_best_pairings(df, pilot_prefs):
+    """
+    Filters the flight data DataFrame based on user preferences.
+
+    Args:
+        df (pd.DataFrame): The flight data DataFrame.
+        pilot_prefs (dict): A dictionary of user preferences.
+
+    Returns:
+        pd.DataFrame: DataFrame of matching flight pairings.
+    """
+    filtered_df = df.copy()
+    print(f"Initial DataFrame size: {len(filtered_df)}")
+
+    # Apply filters and score pairings based on preferences only if they are provided
+
+    # Filter by specific departure date
+    if pilot_prefs.get('specific_departure_date') is not None:
+        specific_dep_date = pilot_prefs['specific_departure_date']
+        # Ensure 'Departure' is in datetime format before extracting date
+        if pd.api.types.is_datetime64_any_dtype(filtered_df['Departure']):
+            filtered_df = filtered_df[filtered_df['Departure'].dt.date == specific_dep_date]
+        else:
+            print("Warning: 'Departure' column is not in datetime format. Cannot filter by specific departure date.")
+        print(f"After filtering by specific departure date ({specific_dep_date}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by specific departure date resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by specific arrival date
+    if pilot_prefs.get('specific_arrival_date') is not None:
+        specific_arr_date = pilot_prefs['specific_arrival_date']
+        # Ensure 'Arrival' is in datetime format before extracting date
+        if pd.api.types.is_datetime64_any_dtype(filtered_df['Arrival']):
+            filtered_df = filtered_df[filtered_df['Arrival'].dt.date == specific_arr_date]
+        else:
+            print("Warning: 'Arrival' column is not in datetime format. Cannot filter by specific arrival date.")
+        print(f"After filtering by specific arrival date ({specific_arr_date}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by specific arrival date resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # New: Filter by preferred departure weekday
+    if pilot_prefs.get('preferred_departure_weekday') is not None:
+        preferred_dep_weekday = pilot_prefs['preferred_departure_weekday'] # Already processed to lowercase full name
+        # Ensure 'Departure Day' column exists and has non-null values before filtering
+        if 'Departure Day' in filtered_df.columns and filtered_df['Departure Day'].notna().any():
+             # Compare against lowercase full name
+             filtered_df = filtered_df[filtered_df['Departure Day'] == preferred_dep_weekday]
+        else:
+            print("Warning: 'Departure Day' column not available or contains only missing values. Cannot filter by preferred departure weekday.")
+        print(f"After filtering by preferred departure weekday ({preferred_dep_weekday}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by preferred departure weekday resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # New: Filter by preferred arrival weekday
+    if pilot_prefs.get('preferred_arrival_weekday') is not None:
+        preferred_arr_weekday = pilot_prefs['preferred_arrival_weekday'] # Already processed to lowercase full name
+        # Ensure 'Arrival Day' column exists and has non-null values before filtering
+        if 'Arrival Day' in filtered_df.columns and filtered_df['Arrival Day'].notna().any():
+             # Compare against lowercase full name
+             filtered_df = filtered_df[filtered_df['Arrival Day'] == preferred_arr_weekday]
+        else:
+            print("Warning: 'Arrival Day' column not available or contains only missing values. Cannot filter by preferred arrival weekday.")
+        print(f"After filtering by preferred arrival weekday ({preferred_arr_weekday}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by preferred arrival weekday resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by preferred weekdays (all days in pairing)
+    # Check if 'weekdays' preference exists and is not None before accessing it
+    if 'weekdays' in pilot_prefs and pilot_prefs['weekdays'] is not None and 'Departure' in filtered_df.columns and 'Arrival' in filtered_df.columns:
+        preferred_full_weekdays = pilot_prefs['weekdays'] # Already processed to lowercase list in get_user_preferences
+
+        # Filter based on the full, lowercase weekday names - check if ALL days in the pairing are preferred weekdays
+        def check_all_days_in_preferred_weekdays(row):
+            departure_time = row['Departure']
+            arrival_time = row['Arrival']
+
+            if pd.isna(departure_time) or pd.isna(arrival_time):
+                return False # Cannot check if dates are invalid
+
+            current_day = departure_time.normalize()
+            end_day = arrival_time.normalize()
+
+            while current_day <= end_day:
+                if current_day.day_name().lower() not in preferred_full_weekdays:
+                    return False # Found a day in the pairing that is not in preferred weekdays
+                current_day += timedelta(days=1)
+
+            return True # All days in the pairing are in preferred weekdays
+
+        # Apply the custom filter function
+        filtered_df = filtered_df[filtered_df.apply(check_all_days_in_preferred_weekdays, axis=1)].copy()
+        print(f"After filtering by preferred weekdays (all days): {len(filtered_df)} rows")
+        if filtered_df.empty:
+             print("Warning: Filtering by preferred weekdays (all days in pairing) resulted in an empty DataFrame.")
+             return pd.DataFrame()
+
+
+    # New: Filter by excluded dates
+    if 'excluded_dates' in pilot_prefs and pilot_prefs['excluded_dates']:
+        excluded_dates = pilot_prefs['excluded_dates']
+        # Filter out rows where either departure or arrival date is in the excluded list
+        # Ensure 'Departure' and 'Arrival' are in datetime format before extracting date
+        if pd.api.types.is_datetime64_any_dtype(filtered_df['Departure']) and pd.api.types.is_datetime64_any_dtype(filtered_df['Arrival']):
+             # Create boolean masks for rows to exclude
+             exclude_mask = (filtered_df['Departure'].dt.date.isin(excluded_dates)) | (filtered_df['Arrival'].dt.date.isin(excluded_dates))
+             # Apply the inverse of the mask to keep rows that are NOT in the excluded dates
+             filtered_df = filtered_df[~exclude_mask].copy()
+        else:
+            print("Warning: 'Departure' or 'Arrival' columns are not in datetime format. Cannot filter by excluded dates.")
+        print(f"After filtering by excluded dates ({excluded_dates}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by excluded dates resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by minimum duration
+    if pilot_prefs.get('min_duration') is not None:
+        # Ensure 'Block hours' is in timedelta format before calculating total_seconds
+        if pd.api.types.is_timedelta64_dtype(filtered_df['Block hours']):
+            filtered_df['Block hours total'] = filtered_df['Block hours'].dt.total_seconds() / 3600
+            filtered_df = filtered_df[filtered_df['Block hours total'] >= pilot_prefs['min_duration']]
+        else:
+             print("Warning: 'Block hours' column is not in timedelta format. Cannot filter by minimum duration.")
+        print(f"After filtering by minimum duration ({pilot_prefs.get('min_duration')} hrs): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by minimum duration resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by maximum duration
+    if pilot_prefs.get('max_duration') is not None:
+         # Ensure 'Block hours' is in timedelta format before calculating total_seconds
+        if pd.api.types.is_timedelta64_dtype(filtered_df['Block hours']):
+            # Recalculate 'Block hours total' if it wasn't done for min_duration
+            if 'Block hours total' not in filtered_df.columns or not pd.api.types.is_float_dtype(filtered_df['Block hours total']):
+                 filtered_df['Block hours total'] = filtered_df['Block hours'].dt.total_seconds() / 3600
+            filtered_df = filtered_df[filtered_df['Block hours total'] <= pilot_prefs['max_duration']]
+        else:
+             print("Warning: 'Block hours' column is not in timedelta format. Cannot filter by maximum duration.")
+        print(f"After filtering by maximum duration ({pilot_prefs.get('max_duration')} hrs): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by maximum duration resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by earliest departure time
+    if pilot_prefs.get('earliest_departure') is not None:
+        earliest_dep_time = pilot_prefs['earliest_departure']
+        # Ensure 'Departure' is in datetime format before extracting time
+        if pd.api.types.is_datetime64_any_dtype(filtered_df['Departure']):
+             filtered_df = filtered_df[filtered_df['Departure'].dt.time >= earliest_dep_time]
+        else:
+             print("Warning: 'Departure' column is not in datetime format. Cannot filter by earliest departure time.")
+        print(f"After filtering by earliest departure time ({earliest_dep_time.strftime('%H:%M')}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by earliest departure time resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by earliest arrival time
+    if pilot_prefs.get('earliest_arrival') is not None:
+        earliest_arr_time = pilot_prefs['earliest_arrival']
+        # Ensure 'Arrival' is in datetime format before extracting time
+        if pd.api.types.is_datetime64_any_dtype(filtered_df['Arrival']):
+            filtered_df = filtered_df[filtered_df['Arrival'].dt.time >= earliest_arr_time]
+        else:
+             print("Warning: 'Arrival' column is not in datetime format. Cannot filter by earliest arrival time.")
+        print(f"After filtering by earliest arrival time ({earliest_arr_time.strftime('%H:%M')}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by earliest arrival time resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Filter by maximum roundtrips
+    if pilot_prefs.get('max_roundtrips') is not None:
+        # Ensure 'Roundtrips' column exists before filtering
+        if 'Roundtrips' in filtered_df.columns and not filtered_df['Roundtrips'].isnull().all():
+            filtered_df = filtered_df[filtered_df['Roundtrips'] <= pilot_prefs['max_roundtrips']]
+        else:
+            print("Warning: 'Roundtrips' column not available or contains only missing values. Cannot filter by maximum roundtrips.")
+        print(f"After filtering by maximum roundtrips ({pilot_prefs.get('max_roundtrips')}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by maximum roundtrips resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+    # Filter by maximum actual flights per day
+    if pilot_prefs.get('max_actual_flights_per_day') is not None:
+        # Ensure 'Actual Flights per Day' column exists before filtering
+        if 'Actual Flights per Day' in filtered_df.columns and not filtered_df['Actual Flights per Day'].isnull().all():
+            filtered_df = filtered_df[filtered_df['Actual Flights per Day'] <= pilot_prefs['max_actual_flights_per_day']]
+        else:
+            print("Warning: 'Actual Flights per Day' column not available or contains only missing values. Cannot filter by maximum actual flights per day.")
+        print(f"After filtering by maximum actual flights per day ({pilot_prefs.get('max_actual_flights_per_day')}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by maximum actual flights per day resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+    # Filter by minimum block hours per pairing day
+    if pilot_prefs.get('min_block_hours_per_day') is not None:
+        # Ensure 'Block Hours per Pairing Day' column exists before filtering
+        if 'Block Hours per Pairing Day' in filtered_df.columns and not filtered_df['Block Hours per Pairing Day'].isnull().all():
+             filtered_df = filtered_df[filtered_df['Block Hours per Pairing Day'] >= pilot_prefs['min_block_hours_per_day']]
+        else:
+            print("Warning: 'Block Hours per Pairing Day' column not available or contains only missing values. Cannot filter by minimum block hours per pairing day.")
+        print(f"After filtering by minimum block hours per pairing day ({pilot_prefs.get('min_block_hours_per_day')}): {len(filtered_df)} rows")
+        if filtered_df.empty:
+            print("Filtering by minimum block hours per pairing day resulted in an empty DataFrame.")
+            return pd.DataFrame()
+
+
+    # Add a dummy 'score' column for demonstration purposes
+    # If scoring logic were more complex, it would be added here based on how well pairings match preferences
+    filtered_df['score'] = 10 # Assign a base score
+
+    # New: Apply sorting based on user preference
+    sort_column = pilot_prefs.get('sort_column')
+    sort_ascending = pilot_prefs.get('sort_ascending', False) # Default to False (descending) if not provided
+
+    if sort_column and sort_column in filtered_df.columns:
+        # Handle timedelta sorting by converting to seconds if necessary
+        if pd.api.types.is_timedelta64_dtype(filtered_df[sort_column]):
+             # Create a temporary column for sorting timedelta
+             filtered_df['temp_sort_column'] = filtered_df[sort_column].dt.total_seconds()
+             recommendations = filtered_df.sort_values(by='temp_sort_column', ascending=sort_ascending)
+             recommendations = recommendations.drop(columns=['temp_sort_column']) # Drop the temporary column
+        else:
+            recommendations = filtered_df.sort_values(by=sort_column, ascending=sort_ascending)
+    else:
+         # Default sort if no column is specified or column is not found
+         # You can define a default sorting logic here if needed
+         # For now, keep the default score-based sorting or no specific sort
+         recommendations = filtered_df.sort_values(by='score', ascending=False) # Default to score descending
+
+
+    # Select relevant columns for the final output
+    # Ensure all output columns exist in the DataFrame before selecting
+    output_columns = ['Pairing', 'Departure', 'Arrival', 'Block hours', 'Pairing details', 'score', 'Boosted Hours', 'Block Hours per Pairing Day', 'Roundtrips', 'Actual Flights per Day']
+    output_columns_existing = [col for col in output_columns if col in recommendations.columns]
+
+    return recommendations[output_columns_existing]
+
+
+if __name__ == '__main__':
+    # Define the path to the CSV file
+    # Updated path to read from Google Drive
+    csv_file_path = "/content/drive/MyDrive/Colab/Flight Pairing Finder APP/pairlist 3 (1).csv" # Updated to new CSV path
+
+    print("Starting flight pairing recommender (CSV version)...")
+
+    # Step 1: Read and parse the data from the CSV
+    flight_data_df = parse_flight_pairings_csv(csv_file_path)
+
+    if flight_data_df.empty:
+        print("Could not process flight data from CSV. Please ensure the CSV file exists and is in the correct format with expected columns.")
+    else:
+        print(f"Successfully processed {len(flight_data_df)} flight pairings from CSV.")
+
+        # Calculate and print the number of rows dropped (if any)
+        # This requires reading the original CSV again just for the count,
+        # which might be inefficient for very large files, but acceptable here.
+        try:
+            # Read from the new Drive path for the initial count
+            initial_rows = pd.read_csv(csv_file_path).shape[0]
+            processed_rows = len(flight_data_df)
+            dropped_rows = initial_rows - processed_rows
+            if dropped_rows > 0:
+                print(f"Note: {dropped_rows} rows were dropped due to missing or invalid data in essential columns (Departure, Arrival, Block hours) during processing.")
+        except Exception as e:
+            print(f"Could not calculate dropped rows: {e}")
+
+
+        print("\n--- Available Data Preview (Raw CSV) ---")
+        try:
+            # Read a small portion of the raw CSV to inspect its structure
+            raw_df_preview = pd.read_csv(csv_file_path, nrows=5)
+            print("Raw CSV Column Names:")
+            print(raw_df_preview.columns.tolist())
+            print("\nRaw CSV Data Preview:")
+            display(raw_df_preview)
+        except Exception as e:
+            print(f"Could not display raw data preview: {e}")
+
+
+        print("\n--- Available Data Preview (Processed DataFrame) ---")
+        # Display relevant columns if they exist
+        # Include original columns and calculated columns for the processed data preview
+        processed_preview_columns = ['Pairing', 'Departure', 'Arrival', 'Block hours', 'Pairing details',
+                                     'Departure Day', 'Arrival Day', 'Boosted Hours',
+                                     'Pairing Duration Days', 'Block Hours per Pairing Day',
+                                     'Roundtrips', 'Actual Flights per Day']
+        processed_preview_columns_existing = [col for col in processed_preview_columns if col in flight_data_df.columns]
+
+        if processed_preview_columns_existing:
+            print("Processed DataFrame Columns:")
+            print(flight_data_df.columns.tolist())
+            print("\nProcessed DataFrame Preview:")
+            # Display a limited number of rows for the preview
+            display(flight_data_df[processed_preview_columns_existing].head())
+        else:
+            print("No relevant columns found for processed data preview.")
+
+
+        # Step 2: Get user preferences
+        pilot_prefs = get_user_preferences()
+
+        print("\n--- Your Entered Preferences ---")
+        print(pilot_prefs)
+
+
+        # Step 3: Find and display recommendations
+        print("\n--- Generating Recommendations ---")
+        best_pairings = find_best_pairings(flight_data_df, pilot_prefs)
+
+        if not best_pairings.empty:
+            print(f"\nFound {len(best_pairings)} pairings that match your criteria:")
+            print(best_pairings.to_string(index=False))
+        else:
+            print("\nNo flight pairings matched your preferences. Please try a different set of criteria.")
